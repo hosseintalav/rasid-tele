@@ -1,8 +1,10 @@
 import os
 import random
 import base64
+import asyncio
 from datetime import datetime
 import jdatetime
+from aiohttp import web
 
 from telegram import (
     Update,
@@ -24,10 +26,10 @@ from playwright.async_api import async_playwright
 # ----------------- تنظیمات -----------------
 TOKEN = "8866229929:AAGWxOLvSJQp5JbRQ-NVh3OOZnGafnZDQlM"
 
-# مراحل مکالمه
+# مراحل مکالمه (FSM)
 CHOOSE_TEMPLATE, GET_DEST_CARD, GET_DEST_NAME, GET_AMOUNT, GET_SRC_CARD, GET_SRC_NAME = range(6)
 
-# تبدیل تصویر محلی به Data URL (Base64) جهت درج بدون نقص در HTML
+# ----------------- تبدیل تصویر محلی به Data URL (Base64) -----------------
 def get_image_base64(rel_path):
     full_path = os.path.join(os.path.dirname(__file__), rel_path)
     if not os.path.exists(full_path):
@@ -38,7 +40,7 @@ def get_image_base64(rel_path):
         encoded = base64.b64encode(f.read()).decode("utf-8")
     return f"data:{mime};base64,{encoded}"
 
-# ----------------- توابع تبدیل اعداد و تاریخ -----------------
+# ----------------- توابع تبدیل اعداد و تاریخ شمسی -----------------
 PERSIAN_DIGITS = {'0':'۰', '1':'۱', '2':'۲', '3':'۳', '4':'۴', '5':'۵', '6':'۶', '7':'۷', '8':'۸', '9':'۹'}
 ENGLISH_DIGITS = {'۰':'0', '۱':'1', '۲':'2', '۳':'3', '۴':'4', '۵':'5', '۶':'6', '۷':'7', '۸':'8', '۹':'9'}
 
@@ -105,8 +107,7 @@ def get_persian_date_724():
 def generate_random_digits(n):
     return to_persian("".join(str(random.randint(0, 9)) for _ in range(n)))
 
-# ----------------- قالب‌های HTML با استفاده از عکس‌های پوشه images -----------------
-
+# ----------------- قالب HTML بلو بانک -----------------
 def render_blu_html(data):
     persian_date, time_str = get_persian_date_blu()
     ref_num = generate_random_digits(12)
@@ -298,7 +299,7 @@ body {{
 </body>
 </html>"""
 
-
+# ----------------- قالب HTML ۷۲۴ -----------------
 def render_724_html(data):
     persian_date, time_str = get_persian_date_724()
     ref_track = generate_random_digits(9)
@@ -502,14 +503,22 @@ body {{
 </body>
 </html>"""
 
-# ----------------- موتور رندر تصویر با کروم -----------------
+# ----------------- موتور رندر Playwright مناسب سرور لینوکس -----------------
 async def generate_receipt_image(template_type, data):
     html_content = render_blu_html(data) if template_type == 'blu' else render_724_html(data)
     filename = f"receipt_{data['user_id']}_{int(datetime.now().timestamp())}.png"
 
     async with async_playwright() as p:
-        # استفاده از کروم نصب‌شده در سیستم
-        browser = await p.chromium.launch(headless=True)
+        # پرچم‌های بهینه‌سازی لینوکس جهت جلوگیری از مسدود شدن حافظه
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
         page = await browser.new_page(
             viewport={"width": 450, "height": 1000},
             device_scale_factor=2
@@ -521,7 +530,7 @@ async def generate_receipt_image(template_type, data):
 
     return filename
 
-# ----------------- کیبوردهای متنی ReplyKeyboard -----------------
+# ----------------- کیبوردهای تلگرام -----------------
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("🔵 رسید بلو بانک"), KeyboardButton("🔴 رسید ۷۲۴")]
@@ -547,7 +556,7 @@ SRC_CARD_KEYBOARD = ReplyKeyboardMarkup(
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "<b>سلام به سیستم صدور رسید سازمانی خوش آمدید.</b>\n\n"
+        "<b>سلام به سیستم صدور رسید شبیه‌ساز خوش آمدید.</b>\n\n"
         "جهت شروع، قالب رسید مد نظر خود را از کیبورد زیر انتخاب فرمایید:"
     )
     await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD, parse_mode=ParseMode.HTML)
@@ -697,7 +706,21 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
-# ----------------- اجرای ربات -----------------
+# ----------------- وب‌سرور داخلی Render -----------------
+async def health_check(request):
+    return web.Response(text="Bot is running smoothly on Render!")
+
+async def start_web_server():
+    server = web.Application()
+    server.router.add_get('/', health_check)
+    runner = web.AppRunner(server)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"Web server started on port {port}")
+
+# ----------------- نقطه ورود اصلی -----------------
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -738,7 +761,11 @@ def main():
     )
 
     app.add_handler(conv_handler)
-    print("ربات تلگرام آماده کار شد.")
+    print("ربات تلگرام آماده به کار است...")
+
+    # راه‌اندازی هم‌زمان وب‌سرور سبک در همان Event Loop ربات
+    loop = asyncio.get_event_loop()
+    loop.create_task(start_web_server())
     app.run_polling()
 
 if __name__ == "__main__":
