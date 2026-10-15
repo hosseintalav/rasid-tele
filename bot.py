@@ -2,6 +2,7 @@ import os
 import random
 import base64
 import asyncio
+import traceback
 from datetime import datetime
 import jdatetime
 from aiohttp import web
@@ -28,7 +29,7 @@ TOKEN = "8866229929:AAGWxOLvSJQp5JbRQ-NVh3OOZnGafnZDQlM"
 CHOOSE_TEMPLATE, GET_DEST_CARD, GET_DEST_NAME, GET_AMOUNT, GET_SRC_CARD, GET_SRC_NAME = range(6)
 
 def get_image_base64(rel_path):
-    full_path = os.path.join(os.path.dirname(__file__), rel_path)
+    full_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel_path)
     if not os.path.exists(full_path):
         return ""
     ext = os.path.splitext(full_path)[1].replace('.', '').lower()
@@ -291,24 +292,36 @@ async def generate_receipt_image(template_type, data):
     filename = f"receipt_{data['user_id']}_{int(datetime.now().timestamp())}.png"
 
     async with async_playwright() as p:
-        # آرگومان‌های لازم جهت سازگاری کامل با کانتینر لینوکس Docker
+        # آرگومان‌های کاملاً سازگار و پایدار با داکر لینوکسی (حذف فلگ مخرب single-process)
         browser = await p.chromium.launch(
             headless=True,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--single-process",
-                "--no-zygote"
+                "--disable-gpu",
+                "--no-first-run"
             ]
         )
         page = await browser.new_page(
             viewport={"width": 450, "height": 1000},
             device_scale_factor=2
         )
-        await page.set_content(html_content, wait_until="networkidle", timeout=25000)
+        
+        # لود بدون بلاک شدن روی منابع خارجی و اطمینان از لود فونت‌ها
+        await page.set_content(html_content, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.evaluate("() => document.fonts.ready")
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
         element = await page.query_selector("#receipt-capture-area")
-        await element.screenshot(path=filename)
+        if element:
+            await element.screenshot(path=filename)
+        else:
+            await page.screenshot(path=filename)
+
         await browser.close()
 
     return filename
@@ -399,6 +412,7 @@ async def get_src_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+    image_path = None
     try:
         image_path = await generate_receipt_image(context.user_data['template'], context.user_data)
         tpl_title = "بلو بانک" if context.user_data['template'] == 'blu' else "۷۲۴"
@@ -417,12 +431,14 @@ async def get_src_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.HTML
             )
 
-        if os.path.exists(image_path):
-            os.remove(image_path)
         await wait_msg.delete()
 
     except Exception as e:
+        print(f"Error in receipt generation: {traceback.format_exc()}")
         await wait_msg.edit_text(f"<b>خطایی رخ داد:</b>\n<code>{str(e)}</code>", parse_mode=ParseMode.HTML)
+    finally:
+        if image_path and os.path.exists(image_path):
+            os.remove(image_path)
 
     return ConversationHandler.END
 
@@ -435,7 +451,6 @@ async def health_check(request):
 
 # ----------------- اجرای همزمان وب سرور و بات -----------------
 async def main_async():
-    # ۱. راه‌اندازی وب‌سرور برای پاسخ به پینگ‌های Render و UptimeRobot
     server = web.Application()
     server.router.add_get('/', health_check)
     runner = web.AppRunner(server)
@@ -445,7 +460,6 @@ async def main_async():
     await site.start()
     print(f"Web server running on port {port}")
 
-    # ۲. راه‌اندازی ربات تلگرام
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
@@ -466,13 +480,11 @@ async def main_async():
 
     app.add_handler(conv_handler)
 
-    # شروع ربات بدون مسدودسازی وب‌سرور
     await app.initialize()
     await app.updater.start_polling(drop_pending_updates=True)
     await app.start()
     print("Telegram Bot is listening...")
 
-    # زنده نگه داشتن برنامه به صورت نامحدود
     try:
         while True:
             await asyncio.sleep(3600)
